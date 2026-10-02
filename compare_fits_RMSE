@@ -69,7 +69,7 @@ import h5py
 # ----------------------------------------------------------------------------
 # CONFIGURATION -- adjust here
 # ----------------------------------------------------------------------------
-DATA_DIR = r"C:\ShaiEtAl2015_fitting\in_silico_framework-master\thesis_data\best_fit\input"          # Folder containing all CSV and NWB files
+DATA_DIR = "<your_folder>"          # Folder containing all CSV and NWB files
 OUTPUT_DIR = "./output"          # Target folder for results
 
 # Prefix before the first "_" in the cell ID -> species label
