@@ -1,0 +1,453 @@
+"""
+Comparison of first fit vs. best fit (NEURON-style fitting results)
+against measured voltage traces (NWB), separated by species (human/mouse).
+
+EXPECTED FILE STRUCTURE (all files in ONE folder, DATA_DIR):
+    best_fit_traces_{ID}.csv
+    first_fit_traces_{ID}.csv
+    {ID}_ephys.nwb
+
+The species is derived from the cell ID prefix BEFORE the first "_",
+e.g. "h_001" -> human, "m_101" -> mouse.
+Adjust SPECIES_PREFIX_MAP below if your prefixes differ.
+
+CSV format (columns):
+    time_ms, sweep00_amp-0.110nA_mV, sweep01_amp+0.090nA_mV, ...
+
+IMPORTANT -- NWB format:
+The uploaded example file is in the classic Allen Institute NWB 1.0 format
+(old, HDF5-based, NOT the modern NWB2 schema). pynwb cannot read NWB 1.0,
+so the file is read directly with h5py (see load_nwb_sweep_table()).
+
+IMPORTANT -- Sweep matching:
+The sweeps in the NWB file are NOT numbered in the order sweep00..sweep03
+(e.g. "Sweep_24", "Sweep_34", ...). The mapping to the CSV columns is
+therefore done via the stimulus amplitude (aibs_stimulus_amplitude_pa),
+not via position/order.
+
+IMPORTANT -- Temporal alignment:
+The fit traces (e.g. 1200 ms) cover only a section of the full NWB sweep
+(several seconds). Alignment is done automatically: the stimulus pulse onset
+is detected from the current trace (stimulus/presentation), and the window is
+placed symmetrically around the known stimulus (buffer = (fit_duration - pulse_duration) / 2
+before and after the pulse). This was verified against the uploaded example cell
+(607124114) (the buffer came out at ~100 ms, a standard value in the Allen protocol).
+
+IMPORTANT -- Error metric for suprathreshold (spiking) sweeps:
+In sweeps with action potentials, small shifts in spike timing strongly dominate
+the pointwise RMSE (a 1 ms timing offset produces >50 mV difference at the
+spike flank), even when the model fits very well in substance. The script
+still computes the RMSE for all sweeps, but additionally outputs separate
+figures for subthreshold vs. suprathreshold sweeps (see the
+'is_suprathreshold' column in summary_per_sweep.csv), so you can take this into
+account in the discussion. For a scientific paper, a feature-based error metric
+(e.g. via eFEL: spike count, frequency, timing, AP width, etc. instead of raw
+voltage) may additionally be appropriate -- this is not covered by this script,
+but can be added.
+
+Output:
+    - output/summary_per_sweep.csv     (error per cell x sweep)
+    - output/summary_per_cell.csv      (averaged error per cell)
+    - output/stats_report.txt          (statistics results)
+    - output/scatter_first_vs_best.png
+    - output/slopegraph_by_species.png
+    - output/boxplot_improvement.png
+"""
+
+import re
+import glob
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import h5py
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION -- adjust here
+# ----------------------------------------------------------------------------
+DATA_DIR = r"C:\ShaiEtAl2015_fitting\in_silico_framework-master\thesis_data\best_fit\input"          # Folder containing all CSV and NWB files
+OUTPUT_DIR = "./output"          # Target folder for results
+
+# Prefix before the first "_" in the cell ID -> species label
+SPECIES_PREFIX_MAP = {
+    "h": "Human",
+    "m": "Mouse",
+}
+
+# How should the error per sweep be computed? "rmse" or "sse"
+ERROR_METRIC = "rmse"
+
+# Minimum number of cells per group above which a significance test
+# (Wilcoxon/t-test) is performed at all. Below this, the script automatically
+# switches to purely descriptive statistics (mean, median, SD, range, individual
+# values) and prints a warning. As a rule of thumb, even n=5 only provides
+# adequate power for very large effects -- the threshold merely prevents a
+# technically computable but meaningless p-value from ending up uncommented
+# in the report. For a robust conclusion, considerably more cells are usually
+# needed (see note in the report).
+MIN_N_FOR_TEST = 5
+
+sns.set_theme(style="whitegrid", context="talk")
+SPECIES_PALETTE = {"Human": "#3B7DD8", "Mouse": "#E07B39"}
+
+
+# ----------------------------------------------------------------------------
+# Helper functions: find files & determine species
+# ----------------------------------------------------------------------------
+def discover_cell_ids(data_dir):
+    """Finds all cell IDs based on existing best_fit_traces_*.csv files."""
+    pattern = os.path.join(data_dir, "best_fit_traces_*.csv")
+    ids = []
+    for f in sorted(glob.glob(pattern)):
+        m = re.match(r"best_fit_traces_(.+)\.csv$", os.path.basename(f))
+        if m:
+            ids.append(m.group(1))
+    return ids
+
+
+def species_from_id(cell_id):
+    prefix = cell_id.split("_")[0]
+    return SPECIES_PREFIX_MAP.get(prefix, "Unknown")
+
+
+# ----------------------------------------------------------------------------
+# Reading: fit CSV and NWB target trace
+# ----------------------------------------------------------------------------
+def load_fit_csv(path):
+    """Reads a fit CSV, returns (time_ms array, dict sweep_name -> voltage array)."""
+    df = pd.read_csv(path)
+    time_ms = df["time_ms"].to_numpy()
+    sweeps = {c: df[c].to_numpy() for c in df.columns if c != "time_ms"}
+    return time_ms, sweeps
+
+
+def sweep_sort_key(name):
+    """Extracts the sweep number from column names like 'sweep00_amp-0.11nA_mV'."""
+    m = re.match(r"sweep(\d+)", name)
+    return int(m.group(1)) if m else name
+
+
+def parse_amp_na_from_colname(colname):
+    """'sweep02_amp+0.150nA_mV' -> 0.150 (nA)."""
+    m = re.search(r"amp([+-]?[0-9.]+)nA", colname)
+    if not m:
+        raise ValueError(f"Could not parse amplitude from column name '{colname}'.")
+    return float(m.group(1))
+
+
+def list_nwb1_sweeps(h5file):
+    """Lists all sweep names in an Allen Institute NWB 1.0 file."""
+    return list(h5file["acquisition"]["timeseries"].keys())
+
+
+def get_stim_pulse_window_ms(h5file, sweep_name):
+    """
+    Finds the start/end of the main current pulse in a sweep (stimulus/presentation)
+    by searching for the longest contiguous segment at the target amplitude.
+    Returns (onset_ms, offset_ms) relative to the start of the sweep.
+    """
+    stim = h5file["stimulus"]["presentation"][sweep_name]
+    data = stim["data"][:]
+    rate = stim["starting_time"].attrs["rate"]
+    amp_pa = float(stim["aibs_stimulus_amplitude_pa"][()])
+    target_amp = amp_pa * 1e-12  # pA -> A
+
+    idx = np.where(np.isclose(data, target_amp, atol=1e-12))[0]
+    if len(idx) == 0:
+        raise ValueError(f"No stimulus plateau at target amplitude found in {sweep_name}.")
+    onset_ms = idx[0] / rate * 1000.0
+    offset_ms = idx[-1] / rate * 1000.0
+    return onset_ms, offset_ms
+
+
+def find_matching_sweep(h5file, target_amp_na, tolerance_pa=2.0, prefer_desc_substr="LS"):
+    """
+    Finds the sweep name in the NWB file whose stimulus amplitude
+    (in aibs_stimulus_amplitude_pa) best matches the target amplitude (in nA).
+    If there are multiple matches, the sweep whose stimulus description
+    contains 'LS' (Long Square - standard protocol for fitting sweeps) is preferred.
+    """
+    target_pa = target_amp_na * 1000.0
+    candidates = []
+    for name in list_nwb1_sweeps(h5file):
+        sw = h5file["acquisition"]["timeseries"][name]
+        if "aibs_stimulus_amplitude_pa" not in sw:
+            continue
+        amp_pa = float(sw["aibs_stimulus_amplitude_pa"][()])
+        if abs(amp_pa - target_pa) <= tolerance_pa:
+            desc = sw["aibs_stimulus_description"][()]
+            desc = desc.decode() if isinstance(desc, bytes) else str(desc)
+            candidates.append((name, amp_pa, desc))
+
+    if not candidates:
+        raise ValueError(f"No sweep with amplitude ~{target_pa} pA found.")
+
+    preferred = [c for c in candidates if prefer_desc_substr in c[2]]
+    chosen = preferred[0] if preferred else candidates[0]
+    return chosen[0]  # sweep name
+
+
+def load_target_sweep(h5file, sweep_name, window_start_ms, n_samples, dt_ms):
+    """Reads the measured voltage for a fixed time window (interpolated onto the dt_ms grid)."""
+    resp = h5file["acquisition"]["timeseries"][sweep_name]
+    data_mv = resp["data"][:] * 1000.0  # V -> mV
+    rate = resp["starting_time"].attrs["rate"]
+    t_full_ms = np.arange(len(data_mv)) / rate * 1000.0
+    t_query = window_start_ms + np.arange(n_samples) * dt_ms
+    v = np.interp(t_query, t_full_ms, data_mv)
+    return v
+
+
+def load_nwb_targets_for_fit(nwb_path, fit_time_ms, sweep_columns):
+    """
+    For each fit sweep column (e.g. 'sweep00_amp-0.110nA_mV'):
+      1. find the matching NWB sweep via the stimulus amplitude
+      2. locate the main current pulse in the sweep
+      3. align the fit time window symmetrically around the pulse
+      4. interpolate the measured voltage onto the fit time grid
+
+    Returns a dict {sweep_column_name: voltage_mV_array} (same length/grid as fit_time_ms).
+    """
+    dt_ms = fit_time_ms[1] - fit_time_ms[0]
+    fit_duration_ms = fit_time_ms[-1] - fit_time_ms[0]
+    n_samples = len(fit_time_ms)
+
+    targets = {}
+    with h5py.File(nwb_path, "r") as h5file:
+        for col in sweep_columns:
+            target_amp_na = parse_amp_na_from_colname(col)
+            sweep_name = find_matching_sweep(h5file, target_amp_na)
+            onset_ms, offset_ms = get_stim_pulse_window_ms(h5file, sweep_name)
+            pulse_duration_ms = offset_ms - onset_ms
+            buffer_ms = (fit_duration_ms - pulse_duration_ms) / 2.0
+            window_start_ms = onset_ms - buffer_ms
+
+            v_target = load_target_sweep(h5file, sweep_name, window_start_ms, n_samples, dt_ms)
+            targets[col] = {
+                "voltage_mV": v_target,
+                "nwb_sweep_name": sweep_name,
+                "is_suprathreshold": bool(np.any(v_target > 0)),  # rough spike heuristic
+            }
+    return targets
+
+
+def compute_error(v_model, v_target, metric="rmse"):
+    """Both arrays are already on the same time grid (see load_nwb_targets_for_fit)."""
+    diff = v_model - v_target
+    if metric == "rmse":
+        return float(np.sqrt(np.mean(diff ** 2)))
+    elif metric == "sse":
+        return float(np.sum(diff ** 2))
+    else:
+        raise ValueError(f"Unknown error metric: {metric}")
+
+
+# ----------------------------------------------------------------------------
+# Main pipeline
+# ----------------------------------------------------------------------------
+def main():
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    cell_ids = discover_cell_ids(DATA_DIR)
+    if not cell_ids:
+        raise SystemExit(f"No 'best_fit_traces_*.csv' files found in {DATA_DIR}.")
+
+    print(f"{len(cell_ids)} cells found: {cell_ids}")
+
+    rows = []
+    for cell_id in cell_ids:
+        species = species_from_id(cell_id)
+        best_path = os.path.join(DATA_DIR, f"best_fit_traces_{cell_id}.csv")
+        first_path = os.path.join(DATA_DIR, f"first_fit_traces_{cell_id}.csv")
+        nwb_path = os.path.join(DATA_DIR, f"{cell_id}_ephys.nwb")
+
+        if not (os.path.exists(best_path) and os.path.exists(first_path) and os.path.exists(nwb_path)):
+            print(f"  [WARNING] Incomplete files for {cell_id}, skipping.")
+            continue
+
+        t_best, sweeps_best = load_fit_csv(best_path)
+        t_first, sweeps_first = load_fit_csv(first_path)
+
+        sweep_names_sorted = sorted(sweeps_best.keys(), key=sweep_sort_key)
+
+        try:
+            targets = load_nwb_targets_for_fit(nwb_path, t_best, sweep_names_sorted)
+        except Exception as e:
+            print(f"  [ERROR] {cell_id}: NWB matching failed ({e}), skipping cell.")
+            continue
+
+        for sweep_name in sweep_names_sorted:
+            tgt = targets[sweep_name]
+            v_target = tgt["voltage_mV"]
+
+            err_first = compute_error(sweeps_first[sweep_name], v_target, ERROR_METRIC)
+            err_best = compute_error(sweeps_best[sweep_name], v_target, ERROR_METRIC)
+
+            rows.append({
+                "cell_id": cell_id,
+                "species": species,
+                "sweep": sweep_name,
+                "nwb_sweep": tgt["nwb_sweep_name"],
+                "is_suprathreshold": tgt["is_suprathreshold"],
+                "error_first": err_first,
+                "error_best": err_best,
+            })
+
+    per_sweep = pd.DataFrame(rows)
+    per_sweep["delta_error"] = per_sweep["error_first"] - per_sweep["error_best"]
+    per_sweep["pct_improvement"] = (
+        per_sweep["delta_error"] / per_sweep["error_first"].replace(0, np.nan) * 100
+    )
+    per_sweep.to_csv(os.path.join(OUTPUT_DIR, "summary_per_sweep.csv"), index=False)
+
+    print("\n--- Note: error separated by sub-/suprathreshold (spike timing effect) ---")
+    print(per_sweep.groupby("is_suprathreshold")[["error_first", "error_best"]].mean().to_string())
+
+    per_cell = (
+        per_sweep.groupby(["cell_id", "species"], as_index=False)
+        .agg(error_first=("error_first", "mean"),
+             error_best=("error_best", "mean"))
+    )
+    per_cell["delta_error"] = per_cell["error_first"] - per_cell["error_best"]
+    per_cell["pct_improvement"] = per_cell["delta_error"] / per_cell["error_first"] * 100
+    per_cell.to_csv(os.path.join(OUTPUT_DIR, "summary_per_cell.csv"), index=False)
+
+    print("\n--- summary_per_cell.csv ---")
+    print(per_cell.to_string(index=False))
+
+    # ------------------------------------------------------------------
+    # Statistics (paired: first vs. best fit), overall + per species
+    # ------------------------------------------------------------------
+    report_lines = []
+
+    def run_paired_tests(df, label):
+        n = len(df)
+        report_lines.append(f"\n=== {label} (n={n}) ===")
+        if n < 2:
+            report_lines.append("Too few cells for an analysis.")
+            return
+
+        diffs = df["error_first"] - df["error_best"]
+
+        # Descriptive statistics are ALWAYS reported, regardless of n
+        report_lines.append("--- Descriptive ---")
+        report_lines.append(f"error_first: mean={df['error_first'].mean():.4f}, "
+                             f"median={df['error_first'].median():.4f}, "
+                             f"SD={df['error_first'].std():.4f}, "
+                             f"range=[{df['error_first'].min():.4f}, {df['error_first'].max():.4f}]")
+        report_lines.append(f"error_best:  mean={df['error_best'].mean():.4f}, "
+                             f"median={df['error_best'].median():.4f}, "
+                             f"SD={df['error_best'].std():.4f}, "
+                             f"range=[{df['error_best'].min():.4f}, {df['error_best'].max():.4f}]")
+        report_lines.append(f"Mean improvement: {diffs.mean():.4f} (SD={diffs.std():.4f})")
+        report_lines.append(f"Mean % improvement: {df['pct_improvement'].mean():.2f}%")
+        if n <= 10:
+            # For small groups, additionally list the individual values so that
+            # nothing is "hidden" behind a mean.
+            report_lines.append("Individual values (cell_id: first -> best, %improvement):")
+            for _, row in df.iterrows():
+                report_lines.append(f"  {row['cell_id']}: {row['error_first']:.3f} -> "
+                                     f"{row['error_best']:.3f}  ({row['pct_improvement']:.1f}%)")
+
+        # Significance test only from MIN_N_FOR_TEST onward; otherwise deliberately
+        # omitted instead of reporting a meaningless p-value uncommented.
+        if n < MIN_N_FOR_TEST:
+            report_lines.append(
+                f"--- No significance test performed (n={n} < MIN_N_FOR_TEST={MIN_N_FOR_TEST}) ---")
+            report_lines.append(
+                "With such small group sizes, a Wilcoxon/t-test has practically no "
+                "statistical power and a p-value could not be meaningfully interpreted "
+                "(even n=5 is usually only sufficient for very large effects). This group should "
+                "only be reported descriptively/exploratively, e.g. as a single-case observation.")
+            return
+
+        report_lines.append("--- Significance test ---")
+        try:
+            w_stat, w_p = stats.wilcoxon(df["error_first"], df["error_best"])
+            report_lines.append(f"Wilcoxon signed-rank: W={w_stat:.3f}, p={w_p:.4g}")
+        except ValueError as e:
+            report_lines.append(f"Wilcoxon not applicable: {e}")
+        t_stat, t_p = stats.ttest_rel(df["error_first"], df["error_best"])
+        report_lines.append(f"Paired t-test:         t={t_stat:.3f}, p={t_p:.4g}")
+
+    run_paired_tests(per_cell, "All cells")
+    for sp in sorted(per_cell["species"].unique()):
+        run_paired_tests(per_cell[per_cell["species"] == sp], sp)
+
+    with open(os.path.join(OUTPUT_DIR, "stats_report.txt"), "w") as f:
+        f.write("\n".join(report_lines))
+    print("\n".join(report_lines))
+
+    # ------------------------------------------------------------------
+    # Plot 1: Scatter error_first vs error_best, color = species
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for sp, color in SPECIES_PALETTE.items():
+        sub = per_cell[per_cell["species"] == sp]
+        ax.scatter(sub["error_first"], sub["error_best"], label=sp,
+                   color=color, s=90, edgecolor="white", linewidth=0.8, zorder=3)
+    lims = [
+        0,
+        max(per_cell["error_first"].max(), per_cell["error_best"].max()) * 1.08
+    ]
+    ax.plot(lims, lims, "--", color="grey", linewidth=1, zorder=1, label="y = x")
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_xlabel(f"Error of first fit ({ERROR_METRIC.upper()})")
+    ax.set_ylabel(f"Error of best fit ({ERROR_METRIC.upper()})")
+    ax.set_title("First fit vs. best fit per cell")
+    ax.legend(frameon=False)
+    ax.set_aspect("equal")
+    sns.despine()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "scatter_first_vs_best.png"), dpi=200)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 2: Slopegraph (paired lines) separated by species
+    # ------------------------------------------------------------------
+    species_list = sorted(per_cell["species"].unique())
+    fig, axes = plt.subplots(1, len(species_list), figsize=(4.5 * len(species_list), 6), sharey=True)
+    if len(species_list) == 1:
+        axes = [axes]
+    for ax, sp in zip(axes, species_list):
+        sub = per_cell[per_cell["species"] == sp]
+        color = SPECIES_PALETTE.get(sp, "grey")
+        for _, row in sub.iterrows():
+            ax.plot([0, 1], [row["error_first"], row["error_best"]],
+                    marker="o", color=color, alpha=0.8, linewidth=1.8)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["First fit", "Best fit"])
+        ax.set_title(f"{sp} (n={len(sub)})")
+        ax.set_xlim(-0.2, 1.2)
+        sns.despine(ax=ax)
+    axes[0].set_ylabel(f"Error ({ERROR_METRIC.upper()})")
+    fig.suptitle("Error change per cell: first fit \u2192 best fit")
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "slopegraph_by_species.png"), dpi=200)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 3: Boxplot of % improvement by species
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sns.boxplot(data=per_cell, x="species", y="pct_improvement",
+                hue="species", palette=SPECIES_PALETTE, ax=ax, width=0.5, legend=False)
+    sns.stripplot(data=per_cell, x="species", y="pct_improvement",
+                  color="black", alpha=0.6, size=6, ax=ax)
+    ax.set_xlabel("")
+    ax.set_ylabel("Improvement (%)")
+    ax.set_title("Relative improvement: best vs. first fit")
+    sns.despine()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "boxplot_improvement.png"), dpi=200)
+    plt.close(fig)
+
+    print(f"\nDone. Results in: {os.path.abspath(OUTPUT_DIR)}")
+
+
+if __name__ == "__main__":
+    main()
