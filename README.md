@@ -4,9 +4,9 @@ Three scripts for working with Allen Institute NWB 1.0 recordings of human and m
 
 | Script | Purpose | Inputs |
 |---|---|---|
-| `compare_fits.py` | First fit vs. best fit: raw voltage error (RMSE or SSE) per sweep, averaged per cell | fit CSVs + NWB |
-| `compare_fits_features.py` | First fit vs. best fit: normalized electrophysiological feature error (via eFEL) per cell | fit CSVs + NWB |
-| `cell_intrinsic_properties.py` | Characterization of the measured cells themselves (passive and active properties), human vs. mouse | NWB only |
+| `compare_fits_RMSE.py` | First fit vs. best fit: raw voltage error (RMSE or SSE) per sweep, averaged per cell | fit CSVs + NWB |
+| `compare_fits_per_features.py` | First fit vs. best fit: normalized electrophysiological feature error (via eFEL) per cell | fit CSVs + NWB |
+| `cell_intrinsic_properties_database.py` | Characterization of the measured cells themselves (passive and active properties), human vs. mouse | NWB only |
 
 The first two compare a model to measurements. The third has no model involved and does not import from the other two.
 
@@ -38,9 +38,9 @@ pip install numpy pandas scipy matplotlib seaborn h5py efel
 
 ## 2. Input files
 
-### 2.1 Fit comparison scripts (`compare_fits.py`, `compare_fits_features.py`)
+### 2.1 Fit comparison scripts (`compare_fits_RMSE.py`, `compare_fits_by_features.py`)
 
-All input files must be in **one folder**, set via `DATA_DIR` in `compare_fits.py`. For every cell with ID `{ID}`, three files are required:
+All input files must be in **one folder**, set via `DATA_DIR` in `compare_fits_RMSE.py`. For every cell with ID `{ID}`, three files are required:
 
 ```
 best_fit_traces_{ID}.csv
@@ -50,9 +50,9 @@ first_fit_traces_{ID}.csv
 
 Cells are discovered automatically from the `best_fit_traces_*.csv` files. A cell is skipped with a warning if any of its three files is missing, or if the NWB sweep matching fails.
 
-### 2.2 Intrinsic properties script (`cell_intrinsic_properties.py`)
+### 2.2 Intrinsic properties script (`cell_intrinsic_properties_database.py`)
 
-Only NWB files are needed, in the folder set via `DATA_DIR` in `cell_intrinsic_properties.py` (its own setting, separate from the one above):
+Only NWB files are needed, in the folder set via `DATA_DIR` in `cell_intrinsic_properties_database.py` (its own setting, separate from the one above):
 
 ```
 {ID}_ephys.nwb
@@ -116,7 +116,7 @@ Assumptions and limitations:
 
 ---
 
-## 4. How `cell_intrinsic_properties.py` works
+## 4. How `cell_intrinsic_properties_database.py` works
 
 ### 4.1 Sweep classification
 
@@ -162,19 +162,19 @@ The main figure shows one bar per species: the mean of the per-cell values, with
 
 ## 5. Configuration
 
-### `compare_fits.py`
+### `compare_fits_RMSE.py`
 
 | Setting | Meaning |
 |---|---|
-| `DATA_DIR` | Folder with all CSV and NWB files. **Currently a hard-coded Windows path, change it to your own.** |
+| `DATA_DIR` | Folder with all CSV and NWB files. **change it to your own.** |
 | `OUTPUT_DIR` | Output folder, default `./output` (relative to the directory you run the script from) |
 | `SPECIES_PREFIX_MAP` | Cell ID prefix to species label |
 | `ERROR_METRIC` | `"rmse"` or `"sse"` |
 | `MIN_N_FOR_TEST` | Minimum cells per group for a significance test (default 5) |
 
-### `compare_fits_features.py`
+### `compare_fits_per_feature.py`
 
-This script imports `DATA_DIR`, `OUTPUT_DIR` and `SPECIES_PREFIX_MAP` from `compare_fits.py`, so those are set in one place. Its own settings:
+This script imports `DATA_DIR`, `OUTPUT_DIR` and `SPECIES_PREFIX_MAP` from `compare_fits_RMSE.py`, so those are set in one place. Its own settings:
 
 | Setting | Meaning |
 |---|---|
@@ -185,11 +185,11 @@ This script imports `DATA_DIR`, `OUTPUT_DIR` and `SPECIES_PREFIX_MAP` from `comp
 
 Feature values are only used if they are valid in **all three** traces (target, first fit, best fit) of a sweep. Features that are undefined in any of them, for example spike features in a subthreshold sweep, are dropped for that sweep.
 
-### `cell_intrinsic_properties.py`
+### `cell_intrinsic_properties_database.py`
 
 | Setting | Meaning |
 |---|---|
-| `DATA_DIR` | Folder with the `*_ephys.nwb` files. **Currently a hard-coded Windows path, change it to your own.** Independent of the `DATA_DIR` in `compare_fits.py`. |
+| `DATA_DIR` | Folder with the `*_ephys.nwb` files. **change it to your own.** Independent of the `DATA_DIR` in `compare_fits.py`. |
 | `OUTPUT_DIR` | Output folder, default `./output` |
 | `SPIKE_THRESHOLD_MV` | eFEL spike threshold, default -20 mV |
 | `LONG_SQUARE_DURATION_RANGE_MS` | Accepted pulse duration for long-square classification, default (800, 1200) |
@@ -200,12 +200,12 @@ Feature values are only used if they are valid in **all three** traces (target, 
 
 ## 6. Running
 
-`compare_fits.py` and `compare_fits_features.py` must be in the **same folder** (the feature script imports from `compare_fits`). `cell_intrinsic_properties.py` can be anywhere. Run each from its folder:
+`compare_fits_RMSE.py` and `compare_fits_by_feature.py` must be in the **same folder** (the feature script imports from `compare_fits`). `cell_intrinsic_properties_database.py` can be anywhere. Run each from its folder:
 
 ```bash
-python compare_fits.py
-python compare_fits_features.py
-python cell_intrinsic_properties.py
+python compare_fits_RMSE.py
+python compare_fits_by_feature.py
+python cell_intrinsic_properties_database.py
 ```
 
 All three are independent of each other's outputs. Note that all use `OUTPUT_DIR = "./output"` by default, so their results end up in the same folder if run from the same directory. The file names do not collide.
@@ -214,28 +214,28 @@ All three are independent of each other's outputs. Note that all use `OUTPUT_DIR
 
 ## 7. Outputs (in `OUTPUT_DIR`)
 
-**`compare_fits.py`**
+**`compare_fits_RMSE.py`**
 
 - `summary_per_sweep.csv`: error per cell and sweep, including `is_suprathreshold`
 - `summary_per_cell.csv`: error averaged per cell, with absolute and percent improvement
 - `stats_report.txt`: descriptive statistics and tests, overall and per species
 - `scatter_first_vs_best.png`, `slopegraph_by_species.png`, `boxplot_improvement.png`
 
-**`compare_fits_features.py`**
+**`compare_fits_by_feature.py`**
 
 - `features_long.csv`: every cell x sweep x feature with target, first and best values and normalized errors
 - `features_per_cell.csv`: mean normalized feature error per cell
 - `features_stats_report.txt`
 - `features_scatter_first_vs_best.png`, `features_slopegraph_by_species.png`, `features_boxplot_improvement.png`, `features_per_feature_barplot.png`
 
-**`cell_intrinsic_properties.py`**
+**`cell_intrinsic_properties_database.py`**
 
 - `intrinsic_properties_per_cell.csv`: per cell, mean and SD of RMP, Rin, tau_m, Cm, Threshold, AP_peak, Halfwidth, plus `Rheobase_pA` and `MaxFreq_Hz`
 - `intrinsic_properties_by_species.csv`: group mean and SEM per species for the eight plotted properties, with `n_cells`
 - `intrinsic_properties_by_species_barplot.png`: main figure, 8 panels, one bar per species (mean ± SEM)
 - `intrinsic_properties_per_cell_barplot.png`: supplementary figure, one bar per cell (error bars are SD across sweeps or spikes)
 
-The docstring at the top of `cell_intrinsic_properties.py` still lists a single `intrinsic_properties_barplot.png`. That file is not produced. The four files above are what the code actually writes.
+The docstring at the top of `cell_intrinsic_properties_database.py` still lists a single `intrinsic_properties_barplot.png`. That file is not produced. The four files above are what the code actually writes.
 
 ## 8. Interpretation notes
 
@@ -251,11 +251,11 @@ The docstring at the top of `cell_intrinsic_properties.py` still lists a single 
 
 | Message | Likely cause |
 |---|---|
-| `No 'best_fit_traces_*.csv' files found in ...` | `DATA_DIR` in `compare_fits.py` is wrong or the file names do not match |
-| `No '*_ephys.nwb' files found in ...` | `DATA_DIR` in `cell_intrinsic_properties.py` is wrong |
+| `No 'best_fit_traces_*.csv' files found in ...` | `DATA_DIR` in `compare_fits_RMSE.py` is wrong or the file names do not match |
+| `No '*_ephys.nwb' files found in ...` | `DATA_DIR` in `cell_intrinsic_properties_database.py` is wrong |
 | `[WARNING] Incomplete files for ...` | One of the three required files is missing for that cell |
 | `[ERROR] ...: NWB matching failed (No sweep with amplitude ~... pA found.)` | No NWB sweep has a matching amplitude. Check the amplitude in the CSV column name and the units |
 | `No stimulus plateau at target amplitude found in ...` | The stimulus trace does not contain the expected amplitude, or the NWB layout differs |
 | `No valid feature values extracted ...` | Check `STIM_START_MS`/`STIM_END_MS` and `SPIKE_THRESHOLD_MV` |
 | `0 hyperpolarizing, 0 depolarizing long-square sweeps found.` | No sweep has a pulse of 800 to 1200 ms, or sweeps are failing to read. Check `LONG_SQUARE_DURATION_RANGE_MS` and the NWB layout |
-| `ModuleNotFoundError: compare_fits` | The feature script is not in the same folder as `compare_fits.py` (see section 8) |
+| `ModuleNotFoundError: compare_fits` | The feature script is not in the same folder as `compare_fits_RMSE.py` (see section 8) |
