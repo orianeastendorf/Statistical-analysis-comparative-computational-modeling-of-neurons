@@ -1,14 +1,15 @@
-# Fit comparison scripts: first fit vs. best fit
+# Fit comparison and cell characterization scripts
 
-Two scripts that compare a first and a best (optimized) NEURON-style model fit against measured voltage traces from an NWB file, separately for human and mouse cells.
+Three scripts for working with Allen Institute NWB 1.0 recordings of human and mouse cells and NEURON-style model fits:
 
-| Script | What it compares |
-|---|---|
-| `compare_fits.py` | Raw voltage error (RMSE or SSE) per sweep, averaged per cell |
-| `compare_fits_features.py` | Normalized electrophysiological feature error (via eFEL) per cell |
+| Script | Purpose | Inputs |
+|---|---|---|
+| `compare_fits.py` | First fit vs. best fit: raw voltage error (RMSE or SSE) per sweep, averaged per cell | fit CSVs + NWB |
+| `compare_fits_features.py` | First fit vs. best fit: normalized electrophysiological feature error (via eFEL) per cell | fit CSVs + NWB |
+| `cell_intrinsic_properties.py` | Characterization of the measured cells themselves (passive and active properties), human vs. mouse | NWB only |
 
+The first two compare a model to measurements. The third has no model involved and does not import from the other two.
 
----
 
 ## 1. Software requirements
 
@@ -17,13 +18,13 @@ Two scripts that compare a first and a best (optimized) NEURON-style model fit a
 
 | Package | Needed by | Notes |
 |---|---|---|
-| `numpy` | both | |
-| `pandas` | both | Named aggregation (`.agg(name=(col, func))`) is used |
-| `scipy` | both | Wilcoxon and paired t-test |
-| `matplotlib` | both | |
-| `seaborn` | both | Version **0.12 or newer** (`sns.boxplot(..., hue=..., legend=False)` is used) |
-| `h5py` | both | Reads the NWB 1.0 files directly |
-| `efel` | `compare_fits_features.py` only | The calls used are `efel.set_setting("Threshold", ...)` and `efel.get_feature_values(..., raise_warnings=False)` |
+| `numpy` | all | |
+| `pandas` | all | Named aggregation (`.agg(name=(col, func))`) is used |
+| `scipy` | `compare_fits.py`, `compare_fits_features.py` | Wilcoxon and paired t-test |
+| `matplotlib` | all | |
+| `seaborn` | all | Version **0.12 or newer** (`sns.boxplot(..., hue=..., legend=False)` is used) |
+| `h5py` | all | Reads the NWB 1.0 files directly |
+| `efel` | `compare_fits_features.py`, `cell_intrinsic_properties.py` | Calls used: `efel.set_setting("Threshold", ...)` and `efel.get_feature_values(..., raise_warnings=False)` |
 
 Install:
 
@@ -37,6 +38,8 @@ pip install numpy pandas scipy matplotlib seaborn h5py efel
 
 ## 2. Input files
 
+### 2.1 Fit comparison scripts (`compare_fits.py`, `compare_fits_features.py`)
+
 All input files must be in **one folder**, set via `DATA_DIR` in `compare_fits.py`. For every cell with ID `{ID}`, three files are required:
 
 ```
@@ -47,18 +50,28 @@ first_fit_traces_{ID}.csv
 
 Cells are discovered automatically from the `best_fit_traces_*.csv` files. A cell is skipped with a warning if any of its three files is missing, or if the NWB sweep matching fails.
 
-### 2.1 Cell ID and species
+### 2.2 Intrinsic properties script (`cell_intrinsic_properties.py`)
+
+Only NWB files are needed, in the folder set via `DATA_DIR` in `cell_intrinsic_properties.py` (its own setting, separate from the one above):
+
+```
+{ID}_ephys.nwb
+```
+
+Cells are discovered from all `*_ephys.nwb` files in that folder. No CSV files are used.
+
+### 2.3 Cell ID and species (all scripts)
 
 The species is read from the part of the cell ID **before the first underscore**:
 
 | Cell ID | Prefix | Species |
 |---|---|---|
-| `h_001` | `h` | Human |
-| `m_101` | `m` | Mouse |
+| `h_001`, `h_562381187` | `h` | Human |
+| `m_101`, `m_501234567` | `m` | Mouse |
 
-Other prefixes are labeled `Unknown`. Extend `SPECIES_PREFIX_MAP` in `compare_fits.py` if you use different prefixes. Note that the plots only color `Human` and `Mouse` (see `SPECIES_PALETTE`), so `Unknown` cells appear in the tables and statistics but not in the scatter plot.
+Other prefixes are labeled `Unknown` and drawn in grey in the intrinsic properties plots. In the fit comparison plots, only `Human` and `Mouse` are colored (see `SPECIES_PALETTE`), so `Unknown` cells appear in the tables and statistics but not in the scatter plot. Extend `SPECIES_PREFIX_MAP` if you use different prefixes. Each script that needs it has its own copy (`compare_fits_features.py` imports it from `compare_fits.py`, `cell_intrinsic_properties.py` defines its own), so change it in both `compare_fits.py` and `cell_intrinsic_properties.py`.
 
-### 2.2 Fit CSV files (`best_fit_traces_*.csv`, `first_fit_traces_*.csv`)
+### 2.4 Fit CSV files (`best_fit_traces_*.csv`, `first_fit_traces_*.csv`)
 
 - One column `time_ms` plus one column per sweep.
 - Sweep column names must follow the pattern `sweepNN_amp<sign><value>nA_mV`, for example:
@@ -72,29 +85,29 @@ time_ms, sweep00_amp-0.110nA_mV, sweep01_amp+0.090nA_mV, sweep02_amp+0.150nA_mV
 - The best-fit and first-fit CSVs of a cell must contain the **same sweep column names**. The time grid of the best-fit file is used to cut the measured target traces.
 - Sweep numbering should be zero-padded (`sweep00`, `sweep01`, ...), because `compare_fits_features.py` sorts the column names alphabetically.
 
-### 2.3 NWB files (`{ID}_ephys.nwb`)
+### 2.5 NWB files (`{ID}_ephys.nwb`)
 
-The files must be in the **classic Allen Institute NWB 1.0 layout** (HDF5), not the modern NWB 2 schema. The scripts read these paths:
+The files must be in the **classic Allen Institute NWB 1.0 layout** (HDF5), not the modern NWB 2 schema. The paths read by each script:
 
-| HDF5 path | Used for |
-|---|---|
-| `acquisition/timeseries/<sweep>/data` | Measured voltage, in **volts** (converted to mV) |
-| `acquisition/timeseries/<sweep>/starting_time` (attribute `rate`) | Sampling rate in Hz |
-| `acquisition/timeseries/<sweep>/aibs_stimulus_amplitude_pa` | Stimulus amplitude in pA, used for sweep matching |
-| `acquisition/timeseries/<sweep>/aibs_stimulus_description` | Stimulus description (sweeps containing `LS` are preferred) |
-| `stimulus/presentation/<sweep>/data` | Stimulus current, in **amperes** |
-| `stimulus/presentation/<sweep>/starting_time` (attribute `rate`) | Sampling rate in Hz |
-| `stimulus/presentation/<sweep>/aibs_stimulus_amplitude_pa` | Target amplitude for pulse detection |
+| HDF5 path | Used for | Fit scripts | Intrinsic script |
+|---|---|---|---|
+| `acquisition/timeseries/<sweep>/data` | Measured voltage, in **volts** (converted to mV) | yes | yes |
+| `acquisition/timeseries/<sweep>/starting_time` (attribute `rate`) | Sampling rate in Hz | yes | yes |
+| `acquisition/timeseries/<sweep>/aibs_stimulus_amplitude_pa` | Stimulus amplitude in pA, used for sweep matching | yes | no |
+| `acquisition/timeseries/<sweep>/aibs_stimulus_description` | Stimulus description (sweeps containing `LS` are preferred) | yes | no |
+| `stimulus/presentation/<sweep>/data` | Stimulus current, in **amperes** | yes | yes |
+| `stimulus/presentation/<sweep>/starting_time` (attribute `rate`) | Sampling rate in Hz | yes | yes |
+| `stimulus/presentation/<sweep>/aibs_stimulus_amplitude_pa` | Target amplitude for pulse detection | yes | no |
 
 ---
 
-## 3. How the scripts match fits to measurements
+## 3. How the fit comparison scripts match fits to measurements
 
 1. **Sweep matching by amplitude.** NWB sweeps are not numbered like the CSV columns (for example `Sweep_24`, `Sweep_34`). Each CSV column is matched to the NWB sweep whose `aibs_stimulus_amplitude_pa` is within **2 pA** of the amplitude in the column name. If several sweeps match, the one whose description contains `LS` (Long Square) is preferred, otherwise the first match is used.
 2. **Pulse detection.** The current pulse is located in `stimulus/presentation` as the span between the first and last sample at the target amplitude (tolerance 1e-12 A).
 3. **Window alignment.** The fit time window is placed symmetrically around the pulse: `buffer = (fit_duration - pulse_duration) / 2` before and after it. The measured voltage is then interpolated onto the fit time grid.
 
-Assumptions and limitations that follow from this:
+Assumptions and limitations:
 
 - The experiment must use a **single square current pulse** per sweep (Allen Long Square protocol).
 - A sweep with an amplitude of **0 pA** is not reliably supported, because the baseline also matches the target amplitude and the whole sweep would be taken as the pulse.
@@ -103,7 +116,51 @@ Assumptions and limitations that follow from this:
 
 ---
 
-## 4. Configuration
+## 4. How `cell_intrinsic_properties.py` works
+
+### 4.1 Sweep classification
+
+It does not use amplitude matching or `aibs_stimulus_description` (which is empty in some files). Instead, each sweep's stimulus is analyzed generically:
+
+1. The baseline is the median of the first `MIN_BASELINE_MS` (100 ms) of the stimulus trace.
+2. Samples that deviate from the baseline by more than 2% of the largest deflection form the pulse. The longest contiguous segment is taken.
+3. The sweep counts as **long square** only if that segment lasts between 800 and 1200 ms (`LONG_SQUARE_DURATION_RANGE_MS`). Ramps, short pulses and noise are thereby excluded.
+4. The amplitude is the median deflection within the pulse. Sweeps below **-5 pA** are hyperpolarizing, above **+5 pA** depolarizing. Sweeps in between are ignored.
+
+Sweeps that raise any error while being read are skipped silently, so check the printed sweep counts per cell.
+
+### 4.2 Passive properties (hyperpolarizing sweeps)
+
+| Property | Method |
+|---|---|
+| RMP (mV) | eFEL `voltage_base` |
+| Rm / Rin (MOhm) | (mean voltage in the last 200 ms of the pulse minus `voltage_base`) / stimulus amplitude |
+| tau_m (ms) | eFEL `decay_time_constant_after_stim` |
+| Cm (pF) | tau_m / Rin (single-compartment RC approximation), per sweep |
+
+Values are averaged over all hyperpolarizing sweeps of a cell. The reported SD is the population SD across sweeps (`np.std`, `ddof=0`).
+
+### 4.3 Active properties (depolarizing sweeps)
+
+| Property | Method |
+|---|---|
+| Rheobase (pA) | Smallest tested amplitude with at least one spike (limited by the amplitude steps of the protocol) |
+| Threshold (mV) | eFEL `AP_begin_voltage`, pooled over all spikes in all spiking sweeps |
+| AP peak (mV) | eFEL `peak_voltage`, pooled the same way |
+| Halfwidth (ms) | eFEL `AP_width`, pooled the same way |
+| Max. frequency (Hz) | Maximum of eFEL `mean_frequency` over all spiking sweeps. One value per cell, no error bar |
+
+The spike threshold for eFEL is `SPIKE_THRESHOLD_MV` (default -20 mV).
+
+If a cell has no spiking sweep, `Rheobase_pA` is `NaN` but `MaxFreq_Hz` is `0.0`, because the running maximum starts at zero.
+
+### 4.4 Species-level aggregation
+
+The main figure shows one bar per species: the mean of the per-cell values, with the **SEM** (SD of the cell means with `ddof=1`, divided by the square root of the number of cells) as the error bar. With a single cell in a group the SEM is `NaN` and no error bar is drawn. No significance tests are performed in this script.
+
+---
+
+## 5. Configuration
 
 ### `compare_fits.py`
 
@@ -128,22 +185,34 @@ This script imports `DATA_DIR`, `OUTPUT_DIR` and `SPECIES_PREFIX_MAP` from `comp
 
 Feature values are only used if they are valid in **all three** traces (target, first fit, best fit) of a sweep. Features that are undefined in any of them, for example spike features in a subthreshold sweep, are dropped for that sweep.
 
+### `cell_intrinsic_properties.py`
+
+| Setting | Meaning |
+|---|---|
+| `DATA_DIR` | Folder with the `*_ephys.nwb` files. **Currently a hard-coded Windows path, change it to your own.** Independent of the `DATA_DIR` in `compare_fits.py`. |
+| `OUTPUT_DIR` | Output folder, default `./output` |
+| `SPIKE_THRESHOLD_MV` | eFEL spike threshold, default -20 mV |
+| `LONG_SQUARE_DURATION_RANGE_MS` | Accepted pulse duration for long-square classification, default (800, 1200) |
+| `MIN_BASELINE_MS` | Baseline window before the stimulus, default 100 ms |
+| `SPECIES_PREFIX_MAP` | Cell ID prefix to species label |
+
 ---
 
-## 5. Running
+## 6. Running
 
-Both scripts must be in the **same folder** (the feature script imports from `compare_fits`). Run them from that folder:
+`compare_fits.py` and `compare_fits_features.py` must be in the **same folder** (the feature script imports from `compare_fits`). `cell_intrinsic_properties.py` can be anywhere. Run each from its folder:
 
 ```bash
 python compare_fits.py
 python compare_fits_features.py
+python cell_intrinsic_properties.py
 ```
 
-They are independent of each other, and the feature script does not need the outputs of the first one.
+All three are independent of each other's outputs. Note that all use `OUTPUT_DIR = "./output"` by default, so their results end up in the same folder if run from the same directory. The file names do not collide.
 
 ---
 
-## 6. Outputs (in `OUTPUT_DIR`)
+## 7. Outputs (in `OUTPUT_DIR`)
 
 **`compare_fits.py`**
 
@@ -159,23 +228,22 @@ They are independent of each other, and the feature script does not need the out
 - `features_stats_report.txt`
 - `features_scatter_first_vs_best.png`, `features_slopegraph_by_species.png`, `features_boxplot_improvement.png`, `features_per_feature_barplot.png`
 
----
+**`cell_intrinsic_properties.py`**
 
-## 7. Interpretation notes
+- `intrinsic_properties_per_cell.csv`: per cell, mean and SD of RMP, Rin, tau_m, Cm, Threshold, AP_peak, Halfwidth, plus `Rheobase_pA` and `MaxFreq_Hz`
+- `intrinsic_properties_by_species.csv`: group mean and SEM per species for the eight plotted properties, with `n_cells`
+- `intrinsic_properties_by_species_barplot.png`: main figure, 8 panels, one bar per species (mean ± SEM)
+- `intrinsic_properties_per_cell_barplot.png`: supplementary figure, one bar per cell (error bars are SD across sweeps or spikes)
+
+The docstring at the top of `cell_intrinsic_properties.py` still lists a single `intrinsic_properties_barplot.png`. That file is not produced. The four files above are what the code actually writes.
+
+## 8. Interpretation notes
 
 - **Spike timing and RMSE.** In spiking sweeps, a 1 ms timing offset can produce more than 50 mV of pointwise difference at the spike flank, so the voltage RMSE can be dominated by timing even for a good fit. Compare `error_first` and `error_best` separately for sub- and suprathreshold sweeps (the script prints this split), and consider the feature-based script as the more robust measure.
 - **Feature normalization.** Each feature error is divided by the standard deviation of that feature's target values across the dataset, with a lower bound of 10% of its mean absolute target value. With few cells this scale can be unstable. This is an empirical scale, not a trial-to-trial variability estimate.
-- **Statistics.** Tests are paired (first vs. best fit, one value per cell): Wilcoxon signed-rank and paired t-test. Groups with fewer than `MIN_N_FOR_TEST` cells get descriptive statistics and individual values only, with no p-value. Even n = 5 only has adequate power for very large effects.
-- **Aggregation.** Sweeps are averaged per cell first, so the statistics treat each cell as one observation.
-
----
-
-## 8. Using the English file names
-
-The English translations are named `compare_fits_en.py` and `compare_fits_features_en.py`. The feature script still contains `from compare_fits import ...`. Either:
-
-- rename `compare_fits_en.py` to `compare_fits.py`, or
-- change the import line in `compare_fits_features_en.py` to `from compare_fits_en import ...`.
+- **Statistics in the fit scripts.** Tests are paired (first vs. best fit, one value per cell): Wilcoxon signed-rank and paired t-test. Groups with fewer than `MIN_N_FOR_TEST` cells get descriptive statistics and individual values only, with no p-value. Even n = 5 only has adequate power for very large effects. Sweeps are averaged per cell first, so each cell is one observation.
+- **Small groups in the intrinsic script.** The SEM is based on the spread of the cell means. With n = 1 it is undefined, and with n = 2 it is valid but unstable, so treat species bars from very few cells as descriptive only.
+- **Rin and Cm are estimates.** Rin is a simple Ohmic estimate from the end of the pulse, and Cm assumes a single RC compartment, so Cm will be biased for cells with extended dendrites.
 
 ---
 
@@ -183,9 +251,11 @@ The English translations are named `compare_fits_en.py` and `compare_fits_featur
 
 | Message | Likely cause |
 |---|---|
-| `No 'best_fit_traces_*.csv' files found in ...` | `DATA_DIR` is wrong or the file names do not match |
+| `No 'best_fit_traces_*.csv' files found in ...` | `DATA_DIR` in `compare_fits.py` is wrong or the file names do not match |
+| `No '*_ephys.nwb' files found in ...` | `DATA_DIR` in `cell_intrinsic_properties.py` is wrong |
 | `[WARNING] Incomplete files for ...` | One of the three required files is missing for that cell |
 | `[ERROR] ...: NWB matching failed (No sweep with amplitude ~... pA found.)` | No NWB sweep has a matching amplitude. Check the amplitude in the CSV column name and the units |
 | `No stimulus plateau at target amplitude found in ...` | The stimulus trace does not contain the expected amplitude, or the NWB layout differs |
 | `No valid feature values extracted ...` | Check `STIM_START_MS`/`STIM_END_MS` and `SPIKE_THRESHOLD_MV` |
+| `0 hyperpolarizing, 0 depolarizing long-square sweeps found.` | No sweep has a pulse of 800 to 1200 ms, or sweeps are failing to read. Check `LONG_SQUARE_DURATION_RANGE_MS` and the NWB layout |
 | `ModuleNotFoundError: compare_fits` | The feature script is not in the same folder as `compare_fits.py` (see section 8) |
