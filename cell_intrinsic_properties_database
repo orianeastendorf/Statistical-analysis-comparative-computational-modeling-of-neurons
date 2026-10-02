@@ -59,7 +59,7 @@ import seaborn as sns
 # ----------------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------------
-DATA_DIR = r"C:\ShaiEtAl2015_fitting\in_silico_framework-master\thesis_data\database_parameters"
+DATA_DIR = "<your_folder>"
 OUTPUT_DIR = "./output"
 
 SPIKE_THRESHOLD_MV = -20.0
