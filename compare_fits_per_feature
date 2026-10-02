@@ -1,0 +1,375 @@
+"""
+Comparison of first fit vs. best fit based on ELECTROPHYSIOLOGICAL FEATURES
+(instead of raw voltage RMSE), using eFEL (https://efel.readthedocs.io).
+
+Motivation:
+In suprathreshold (spiking) sweeps, small spike timing shifts strongly dominate
+the pointwise voltage RMSE, even when a fit is very good in substance
+(cf. compare_fits.py). A feature-based comparison (spike count, frequency,
+AP amplitude/width, resting potential, adaptation, AHP depth, ...) is more robust
+to timing jitter and better reflects whether the model captures the physiological
+behavior of the cell. For the publication, comparing both approaches
+(RMSE- vs. feature-based) is worthwhile.
+
+DEPENDENCY: This script uses the same file reading/alignment functions
+as compare_fits.py (load_fit_csv, load_nwb_targets_for_fit). compare_fits.py must
+therefore be located in the same folder.
+
+EXPECTED FILE STRUCTURE (identical to compare_fits.py):
+    best_fit_traces_{ID}.csv
+    first_fit_traces_{ID}.csv
+    {ID}_ephys.nwb
+Species is derived from the prefix before the first "_" of the cell ID (h_/m_).
+
+STIMULUS WINDOW: In the fit traces, the current pulse starts at STIM_START_MS and
+ends at STIM_END_MS (see compare_fits.py: detected automatically, but for eFEL
+we need the values explicitly as constants -- the standard in the Allen protocol is
+a 100 ms buffer before and after the pulse). If your fit traces have a different
+duration or a different buffer, adjust here or derive it directly from the pulse
+(see note in main()).
+
+Output:
+    - output/features_long.csv         (each cell x sweep x feature, raw values + error)
+    - output/features_per_cell.csv     (normalized feature error score per cell)
+    - output/features_stats_report.txt
+    - output/features_scatter_first_vs_best.png
+    - output/features_slopegraph_by_species.png
+    - output/features_boxplot_improvement.png
+    - output/features_per_feature_barplot.png   (which features improve by how much)
+"""
+
+import os
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import efel
+
+from compare_fits import (
+    DATA_DIR, OUTPUT_DIR, SPECIES_PREFIX_MAP,
+    discover_cell_ids, species_from_id, load_fit_csv, load_nwb_targets_for_fit,
+)
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+# Stimulus window WITHIN the fit traces (not within the full NWB sweeps!).
+# Verified for the Allen long-square protocol (100 ms buffer, 1000 ms pulse).
+# If your fit traces have a different length/convention: adjust.
+STIM_START_MS = 100.0
+STIM_END_MS = 1100.0
+
+# eFEL spike threshold (mV) -- default is -20 mV, adjust to your cells if needed
+SPIKE_THRESHOLD_MV = -20.0
+
+# Which features are compared. Subthreshold features may yield deviating/irrelevant
+# values in spiking sweeps, spike features yield None in purely subthreshold
+# sweeps -- both are filtered automatically (see computation in the main part:
+# only features that have a valid value in ALL THREE traces (target/first/best)
+# are included in the analysis).
+FEATURE_NAMES = [
+    "voltage_base",
+    "steady_state_voltage_stimend",
+    "Spikecount",
+    "mean_frequency",
+    "AP_amplitude",
+    "AP_width",
+    "time_to_first_spike",
+    "ISI_CV",
+    "AHP_depth",
+    "adaptation_index2",
+]
+
+sns.set_theme(style="whitegrid", context="talk")
+SPECIES_PALETTE = {"Human": "#3B7DD8", "Mouse": "#E07B39"}
+
+# See compare_fits.py for the rationale: below this number of cells per group,
+# the script switches to purely descriptive statistics instead of a meaningless
+# p-value.
+MIN_N_FOR_TEST = 5
+
+
+# ----------------------------------------------------------------------------
+# eFEL helper functions
+# ----------------------------------------------------------------------------
+def make_efel_trace(time_ms, voltage_mV, stim_start=STIM_START_MS, stim_end=STIM_END_MS):
+    return {"T": time_ms, "V": voltage_mV, "stim_start": [stim_start], "stim_end": [stim_end]}
+
+
+def extract_features(time_ms, voltage_mV, feature_names=FEATURE_NAMES):
+    """Returns dict {feature_name: float or None} (mean if list, None if not available)."""
+    efel.set_setting("Threshold", SPIKE_THRESHOLD_MV)
+    trace = make_efel_trace(time_ms, voltage_mV)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = efel.get_feature_values([trace], feature_names, raise_warnings=False)[0]
+    out = {}
+    for name in feature_names:
+        v = result.get(name)
+        if v is None or len(v) == 0:
+            out[name] = None
+        else:
+            out[name] = float(np.nanmean(v))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Main pipeline
+# ----------------------------------------------------------------------------
+def main():
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    cell_ids = discover_cell_ids(DATA_DIR)
+    if not cell_ids:
+        raise SystemExit(f"No 'best_fit_traces_*.csv' files found in {DATA_DIR}.")
+
+    print(f"{len(cell_ids)} cells found: {cell_ids}")
+
+    long_rows = []
+    for cell_id in cell_ids:
+        species = species_from_id(cell_id)
+        best_path = os.path.join(DATA_DIR, f"best_fit_traces_{cell_id}.csv")
+        first_path = os.path.join(DATA_DIR, f"first_fit_traces_{cell_id}.csv")
+        nwb_path = os.path.join(DATA_DIR, f"{cell_id}_ephys.nwb")
+
+        if not (os.path.exists(best_path) and os.path.exists(first_path) and os.path.exists(nwb_path)):
+            print(f"  [WARNING] Incomplete files for {cell_id}, skipping.")
+            continue
+
+        t_best, sweeps_best = load_fit_csv(best_path)
+        t_first, sweeps_first = load_fit_csv(first_path)
+        sweep_names_sorted = sorted(sweeps_best.keys())
+
+        try:
+            targets = load_nwb_targets_for_fit(nwb_path, t_best, sweep_names_sorted)
+        except Exception as e:
+            print(f"  [ERROR] {cell_id}: NWB matching failed ({e}), skipping cell.")
+            continue
+
+        for sweep_name in sweep_names_sorted:
+            v_target = targets[sweep_name]["voltage_mV"]
+            v_first = sweeps_first[sweep_name]
+            v_best = sweeps_best[sweep_name]
+
+            feats_target = extract_features(t_best, v_target)
+            feats_first = extract_features(t_first, v_first)
+            feats_best = extract_features(t_best, v_best)
+
+            for fname in FEATURE_NAMES:
+                vt, vf, vb = feats_target[fname], feats_first[fname], feats_best[fname]
+                if vt is None or vf is None or vb is None:
+                    continue  # Feature not available in at least one trace -> skip
+                long_rows.append({
+                    "cell_id": cell_id,
+                    "species": species,
+                    "sweep": sweep_name,
+                    "feature": fname,
+                    "target_value": vt,
+                    "first_value": vf,
+                    "best_value": vb,
+                    "abs_error_first": abs(vf - vt),
+                    "abs_error_best": abs(vb - vt),
+                })
+
+    if not long_rows:
+        raise SystemExit("No valid feature values extracted -- check stimulus window/threshold.")
+
+    long_df = pd.DataFrame(long_rows)
+    long_df.to_csv(os.path.join(OUTPUT_DIR, "features_long.csv"), index=False)
+    print(f"\n{len(long_df)} feature measurements (cell x sweep x feature) extracted.")
+
+    # ------------------------------------------------------------------
+    # Normalization: divide each feature by the spread of the target values
+    # in the dataset (empirical scale), so that errors with different units
+    # (mV, Hz, spike count, ms) become comparable/aggregable.
+    # (Analogous to the principle of BluePyOpt objective functions, where
+    # normalization is usually done by the trial-to-trial standard deviation;
+    # here, lacking repeated measurements, we use the spread across the dataset.)
+    #
+    # IMPORTANT: With few cells/sweeps, the SD per feature can be very small
+    # or unstable (e.g. if a feature has similar target values across all
+    # sweeps) -- this would artificially inflate the normalized error.
+    # As a safety net, a minimum of 10% of the mean absolute value of the
+    # feature target value is used as the lower bound for the scale. As the
+    # number of cells grows, the SD estimate automatically becomes more
+    # stable/meaningful.
+    # ------------------------------------------------------------------
+    feature_std = long_df.groupby("feature")["target_value"].std()
+    feature_meanabs = long_df.groupby("feature")["target_value"].apply(lambda x: np.abs(x).mean())
+    feature_scale = feature_std.combine(feature_meanabs, lambda s, m: max(s if pd.notna(s) else 0.0, 0.1 * m))
+    feature_scale = feature_scale.replace(0, 1.0)
+
+    long_df["norm_error_first"] = long_df.apply(
+        lambda r: r["abs_error_first"] / feature_scale[r["feature"]], axis=1)
+    long_df["norm_error_best"] = long_df.apply(
+        lambda r: r["abs_error_best"] / feature_scale[r["feature"]], axis=1)
+    long_df.to_csv(os.path.join(OUTPUT_DIR, "features_long.csv"), index=False)  # overwrite with normalization
+
+    # ------------------------------------------------------------------
+    # Aggregation per cell: mean normalized feature error
+    # ------------------------------------------------------------------
+    per_cell = (
+        long_df.groupby(["cell_id", "species"], as_index=False)
+        .agg(feature_error_first=("norm_error_first", "mean"),
+             feature_error_best=("norm_error_best", "mean"),
+             n_features_used=("feature", "count"))
+    )
+    per_cell["delta_error"] = per_cell["feature_error_first"] - per_cell["feature_error_best"]
+    per_cell["pct_improvement"] = per_cell["delta_error"] / per_cell["feature_error_first"] * 100
+    per_cell.to_csv(os.path.join(OUTPUT_DIR, "features_per_cell.csv"), index=False)
+
+    print("\n--- features_per_cell.csv ---")
+    print(per_cell.to_string(index=False))
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
+    report_lines = []
+
+    def run_paired_tests(df, label):
+        n = len(df)
+        report_lines.append(f"\n=== {label} (n={n}) ===")
+        if n < 2:
+            report_lines.append("Too few cells for an analysis.")
+            return
+
+        diffs = df["feature_error_first"] - df["feature_error_best"]
+
+        report_lines.append("--- Descriptive ---")
+        report_lines.append(f"feature_error_first: mean={df['feature_error_first'].mean():.4f}, "
+                             f"median={df['feature_error_first'].median():.4f}, "
+                             f"SD={df['feature_error_first'].std():.4f}, "
+                             f"range=[{df['feature_error_first'].min():.4f}, {df['feature_error_first'].max():.4f}]")
+        report_lines.append(f"feature_error_best:  mean={df['feature_error_best'].mean():.4f}, "
+                             f"median={df['feature_error_best'].median():.4f}, "
+                             f"SD={df['feature_error_best'].std():.4f}, "
+                             f"range=[{df['feature_error_best'].min():.4f}, {df['feature_error_best'].max():.4f}]")
+        report_lines.append(f"Mean improvement (normalized error): {diffs.mean():.4f} (SD={diffs.std():.4f})")
+        report_lines.append(f"Mean % improvement: {df['pct_improvement'].mean():.2f}%")
+        if n <= 10:
+            report_lines.append("Individual values (cell_id: first -> best, %improvement):")
+            for _, row in df.iterrows():
+                report_lines.append(f"  {row['cell_id']}: {row['feature_error_first']:.3f} -> "
+                                     f"{row['feature_error_best']:.3f}  ({row['pct_improvement']:.1f}%)")
+
+        if n < MIN_N_FOR_TEST:
+            report_lines.append(
+                f"--- No significance test performed (n={n} < MIN_N_FOR_TEST={MIN_N_FOR_TEST}) ---")
+            report_lines.append(
+                "With such small group sizes, a Wilcoxon/t-test has practically no "
+                "statistical power and a p-value could not be meaningfully interpreted. "
+                "This group should only be reported descriptively/exploratively.")
+            return
+
+        report_lines.append("--- Significance test ---")
+        try:
+            w_stat, w_p = stats.wilcoxon(df["feature_error_first"], df["feature_error_best"])
+            report_lines.append(f"Wilcoxon signed-rank: W={w_stat:.3f}, p={w_p:.4g}")
+        except ValueError as e:
+            report_lines.append(f"Wilcoxon not applicable: {e}")
+        t_stat, t_p = stats.ttest_rel(df["feature_error_first"], df["feature_error_best"])
+        report_lines.append(f"Paired t-test:         t={t_stat:.3f}, p={t_p:.4g}")
+
+    run_paired_tests(per_cell, "All cells")
+    for sp in sorted(per_cell["species"].unique()):
+        run_paired_tests(per_cell[per_cell["species"] == sp], sp)
+
+    with open(os.path.join(OUTPUT_DIR, "features_stats_report.txt"), "w") as f:
+        f.write("\n".join(report_lines))
+    print("\n".join(report_lines))
+
+    # ------------------------------------------------------------------
+    # Plot 1: Scatter
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for sp, color in SPECIES_PALETTE.items():
+        sub = per_cell[per_cell["species"] == sp]
+        ax.scatter(sub["feature_error_first"], sub["feature_error_best"], label=sp,
+                   color=color, s=90, edgecolor="white", linewidth=0.8, zorder=3)
+    lims = [0, max(per_cell["feature_error_first"].max(), per_cell["feature_error_best"].max()) * 1.08]
+    ax.plot(lims, lims, "--", color="grey", linewidth=1, zorder=1, label="y = x")
+    ax.set_xlim(lims); ax.set_ylim(lims)
+    ax.set_xlabel("Feature error (normalized), first fit")
+    ax.set_ylabel("Feature error (normalized), best fit")
+    ax.set_title("First fit vs. best fit (feature-based)")
+    ax.legend(frameon=False)
+    ax.set_aspect("equal")
+    sns.despine()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "features_scatter_first_vs_best.png"), dpi=200)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 2: Slopegraph by species
+    # ------------------------------------------------------------------
+    species_list = sorted(per_cell["species"].unique())
+    fig, axes = plt.subplots(1, len(species_list), figsize=(4.5 * len(species_list), 6), sharey=True)
+    if len(species_list) == 1:
+        axes = [axes]
+    for ax, sp in zip(axes, species_list):
+        sub = per_cell[per_cell["species"] == sp]
+        color = SPECIES_PALETTE.get(sp, "grey")
+        for _, row in sub.iterrows():
+            ax.plot([0, 1], [row["feature_error_first"], row["feature_error_best"]],
+                    marker="o", color=color, alpha=0.8, linewidth=1.8)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["First fit", "Best fit"])
+        ax.set_title(f"{sp} (n={len(sub)})")
+        ax.set_xlim(-0.2, 1.2)
+        sns.despine(ax=ax)
+    axes[0].set_ylabel("Feature error (normalized)")
+    fig.suptitle("Feature error per cell: first fit \u2192 best fit")
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "features_slopegraph_by_species.png"), dpi=200)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 3: Boxplot of % improvement by species
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(6, 6))
+    sns.boxplot(data=per_cell, x="species", y="pct_improvement",
+                hue="species", palette=SPECIES_PALETTE, ax=ax, width=0.5, legend=False)
+    sns.stripplot(data=per_cell, x="species", y="pct_improvement",
+                  color="black", alpha=0.6, size=6, ax=ax)
+    ax.set_xlabel("")
+    ax.set_ylabel("Improvement (%)")
+    ax.set_title("Relative improvement (feature-based)")
+    sns.despine()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "features_boxplot_improvement.png"), dpi=200)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Plot 4: Which individual features improve by how much?
+    # (mean normalized error per feature, first vs. best fit)
+    # ------------------------------------------------------------------
+    per_feature = (
+        long_df.groupby("feature", as_index=False)
+        .agg(mean_norm_error_first=("norm_error_first", "mean"),
+             mean_norm_error_best=("norm_error_best", "mean"),
+             n=("feature", "count"))
+        .sort_values("mean_norm_error_first", ascending=False)
+    )
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.5 * len(per_feature))))
+    y = np.arange(len(per_feature))
+    ax.barh(y - 0.2, per_feature["mean_norm_error_first"], height=0.4, color="#C94C4C", label="First fit")
+    ax.barh(y + 0.2, per_feature["mean_norm_error_best"], height=0.4, color="#4C9A6A", label="Best fit")
+    ax.set_yticks(y)
+    ax.set_yticklabels(per_feature["feature"])
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean normalized error")
+    ax.set_title("Error per feature: first vs. best fit")
+    ax.legend(frameon=False)
+    sns.despine()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "features_per_feature_barplot.png"), dpi=200)
+    plt.close(fig)
+
+    print(f"\nDone. Results in: {os.path.abspath(OUTPUT_DIR)}")
+
+
+if __name__ == "__main__":
+    main()
