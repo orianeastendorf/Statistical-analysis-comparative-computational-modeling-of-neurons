@@ -20,11 +20,11 @@ The first two compare a model to measurements. The third has no model involved a
 |---|---|---|
 | `numpy` | all | |
 | `pandas` | all | Named aggregation (`.agg(name=(col, func))`) is used |
-| `scipy` | `compare_fits.py`, `compare_fits_features.py` | Wilcoxon and paired t-test |
+| `scipy` | `compare_fits_RMSE.py`, `compare_fits_by_feature.py` | Wilcoxon and paired t-test |
 | `matplotlib` | all | |
 | `seaborn` | all | Version **0.12 or newer** (`sns.boxplot(..., hue=..., legend=False)` is used) |
 | `h5py` | all | Reads the NWB 1.0 files directly |
-| `efel` | `compare_fits_features.py`, `cell_intrinsic_properties.py` | Calls used: `efel.set_setting("Threshold", ...)` and `efel.get_feature_values(..., raise_warnings=False)` |
+| `efel` | `compare_fits_by_feature.py`, `cell_intrinsic_properties_database.py` | Calls used: `efel.set_setting("Threshold", ...)` and `efel.get_feature_values(..., raise_warnings=False)` |
 
 Install:
 
