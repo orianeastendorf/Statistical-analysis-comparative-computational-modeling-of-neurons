@@ -7,7 +7,6 @@ Two scripts that compare a first and a best (optimized) NEURON-style model fit a
 | `compare_fits.py` | Raw voltage error (RMSE or SSE) per sweep, averaged per cell |
 | `compare_fits_features.py` | Normalized electrophysiological feature error (via eFEL) per cell |
 
-If you use the English versions (`compare_fits_en.py`, `compare_fits_features_en.py`), see [Using the English file names](#using-the-english-file-names).
 
 ---
 
