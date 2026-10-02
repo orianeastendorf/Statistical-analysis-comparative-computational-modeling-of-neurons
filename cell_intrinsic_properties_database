@@ -1,0 +1,416 @@
+"""
+Extracts intrinsic electrophysiological properties directly from raw
+NWB 1.0 files (Allen Institute format) and compares them across multiple
+cells in a combined bar plot (8 panels, one bar per cell).
+
+Unlike compare_fits.py / compare_fits_features.py, this is NOT a
+model-vs-measurement comparison, but a pure CHARACTERIZATION of the measured
+cells themselves -- only the *_ephys.nwb files are required,
+no fit CSVs.
+
+EXPECTED FILE STRUCTURE:
+    {ID}_ephys.nwb   (one file per cell, in the same folder, DATA_DIR)
+The cell ID is derived from the file name before "_ephys.nwb".
+
+METRICS AND METHODOLOGY:
+
+Passive properties (from hyperpolarizing long-square sweeps, amp < 0):
+    - RMP (resting membrane potential): eFEL voltage_base (voltage before stimulus)
+    - Rm (input resistance, MOhm): simple Ohmic estimate per sweep,
+      (steady-state voltage deflection) / (stimulus amplitude)
+    - tau_m (membrane time constant, ms): eFEL decay_time_constant_after_stim
+    - Cm (membrane capacitance, pF): derived as tau_m / Rm (single-compartment
+      RC approximation), computed per sweep from the respective tau_m/Rm pair
+    All four values are averaged across all available hyperpolarizing sweeps
+    of a cell (mean +/- SD as error bars).
+
+Active properties (from depolarizing long-square sweeps, amp > 0):
+    - Rheobase (pA): smallest tested current amplitude with >=1 spike
+    - Threshold (mV): eFEL AP_begin_voltage, pooled across ALL spikes of all
+      suprathreshold sweeps of this cell (mean +/- SD across spikes)
+    - AP peak (mV): eFEL peak_voltage (absolute peak voltage), pooled as above
+    - Halfwidth (ms): eFEL AP_width, pooled as above
+    - Max. spiking frequency (Hz): maximum of eFEL mean_frequency across all
+      tested suprathreshold sweeps -- ONE single value per cell, no
+      error bar (there is no natural repetition for "the maximum").
+
+Sweep classification: long-square sweeps are detected generically based on the
+plateau duration of the current stimulus (~1000 ms), not based on
+aibs_stimulus_description (the field is empty in some files). Ramp,
+short-pulse and noise stimuli are thereby excluded automatically.
+
+Output:
+    - output/intrinsic_properties_per_cell.csv
+    - output/intrinsic_properties_barplot.png
+"""
+
+import os
+import re
+import glob
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import h5py
+import efel
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+DATA_DIR = r"C:\ShaiEtAl2015_fitting\in_silico_framework-master\thesis_data\database_parameters"
+OUTPUT_DIR = "./output"
+
+SPIKE_THRESHOLD_MV = -20.0
+LONG_SQUARE_DURATION_RANGE_MS = (800, 1200)  # Plateau duration for sweep classification
+MIN_BASELINE_MS = 100  # Baseline window before stimulus for voltage_base etc.
+
+# Species assignment via the prefix before the first "_" of the cell ID, identical
+# to the convention in compare_fits.py. Files must be named accordingly,
+# e.g. "h_562381187_ephys.nwb" (Human) or "m_501234567_ephys.nwb" (Mouse).
+SPECIES_PREFIX_MAP = {
+    "h": "Human",
+    "m": "Mouse",
+}
+SPECIES_PALETTE = {"Human": "#3B7DD8", "Mouse": "#E07B39"}
+
+sns.set_theme(style="whitegrid", context="talk")
+
+
+# ----------------------------------------------------------------------------
+# Find files
+# ----------------------------------------------------------------------------
+def discover_cell_ids(data_dir):
+    pattern = os.path.join(data_dir, "*_ephys.nwb")
+    ids = []
+    for f in sorted(glob.glob(pattern)):
+        m = re.match(r"(.+)_ephys\.nwb$", os.path.basename(f))
+        if m:
+            ids.append(m.group(1))
+    return ids
+
+
+def species_from_id(cell_id):
+    prefix = cell_id.split("_")[0]
+    return SPECIES_PREFIX_MAP.get(prefix, "Unknown")
+
+
+# ----------------------------------------------------------------------------
+# NWB 1.0 sweep detection (generic, without amplitude matching as in compare_fits.py)
+# ----------------------------------------------------------------------------
+def get_pulse_window_and_amp(h5file, sweep_name):
+    """
+    Detects the main plateau of a current stimulus generically: longest contiguous
+    segment that deviates clearly from the baseline (first MIN_BASELINE_MS). Returns
+    (onset_ms, offset_ms, amplitude_pA) or None if no clear plateau can be
+    identified (e.g. ramp, noise, zero stimulus).
+    """
+    stim = h5file["stimulus"]["presentation"][sweep_name]
+    data = stim["data"][:]
+    rate = stim["starting_time"].attrs["rate"]
+    n_baseline = int(MIN_BASELINE_MS / 1000 * rate)
+    baseline = np.median(data[:n_baseline])
+
+    # Tolerance: 2% of the largest observed deflection, at least 1 pA
+    dev = data - baseline
+    scale = max(np.abs(dev).max(), 1e-12)
+    mask = np.abs(dev) > 0.02 * scale
+    if not np.any(mask):
+        return None
+
+    idx = np.where(mask)[0]
+    # find longest contiguous segment
+    splits = np.where(np.diff(idx) > 1)[0]
+    segments = np.split(idx, splits + 1)
+    longest = max(segments, key=len)
+
+    onset_ms = longest[0] / rate * 1000.0
+    offset_ms = longest[-1] / rate * 1000.0
+    duration_ms = offset_ms - onset_ms
+
+    lo, hi = LONG_SQUARE_DURATION_RANGE_MS
+    if not (lo <= duration_ms <= hi):
+        return None
+
+    amp_a = np.median(data[longest[0]:longest[-1] + 1] - baseline)
+    amp_pa = amp_a * 1e12
+    return onset_ms, offset_ms, amp_pa
+
+
+def load_response(h5file, sweep_name):
+    """Full response trace (mV) and time axis (ms) for a sweep."""
+    resp = h5file["acquisition"]["timeseries"][sweep_name]
+    data_mv = resp["data"][:] * 1000.0
+    rate = resp["starting_time"].attrs["rate"]
+    t_ms = np.arange(len(data_mv)) / rate * 1000.0
+    return t_ms, data_mv
+
+
+def classify_long_square_sweeps(nwb_path):
+    """
+    Scans all sweeps of an NWB file and returns two lists:
+    hyperpol_sweeps and depol_sweeps, each as a list of dicts with
+    {name, onset_ms, offset_ms, amp_pA, t_ms, v_mV}.
+    """
+    hyperpol, depol = [], []
+    with h5py.File(nwb_path, "r") as h5file:
+        for name in h5file["acquisition"]["timeseries"].keys():
+            try:
+                result = get_pulse_window_and_amp(h5file, name)
+                if result is None:
+                    continue
+                onset_ms, offset_ms, amp_pa = result
+                t_ms, v_mv = load_response(h5file, name)
+                entry = {"name": name, "onset_ms": onset_ms, "offset_ms": offset_ms,
+                         "amp_pA": amp_pa, "t_ms": t_ms, "v_mV": v_mv}
+                if amp_pa < -5:
+                    hyperpol.append(entry)
+                elif amp_pa > 5:
+                    depol.append(entry)
+            except Exception:
+                continue  # Skip sweep if the structure is unexpected
+    return hyperpol, depol
+
+
+# ----------------------------------------------------------------------------
+# Passive properties
+# ----------------------------------------------------------------------------
+def compute_passive_properties(hyperpol_sweeps):
+    """Returns dict with lists of values (per sweep) for RMP, Rin, tau_m, Cm."""
+    rmp_vals, rin_vals, tau_vals, cm_vals = [], [], [], []
+
+    for sw in hyperpol_sweeps:
+        trace = {"T": sw["t_ms"], "V": sw["v_mV"],
+                 "stim_start": [sw["onset_ms"]], "stim_end": [sw["offset_ms"]]}
+        try:
+            feats = efel.get_feature_values(
+                [trace], ["voltage_base", "decay_time_constant_after_stim"],
+                raise_warnings=False)[0]
+        except Exception:
+            continue
+
+        vbase = feats.get("voltage_base")
+        tau = feats.get("decay_time_constant_after_stim")
+        if vbase is None or len(vbase) == 0:
+            continue
+        vbase = float(vbase[0])
+        rmp_vals.append(vbase)
+
+        # Steady-state deflection: last 200 ms of the plateau
+        mask = (sw["t_ms"] >= sw["offset_ms"] - 200) & (sw["t_ms"] <= sw["offset_ms"])
+        if not np.any(mask):
+            continue
+        v_ss = np.mean(sw["v_mV"][mask])
+        deflection_mv = v_ss - vbase
+        rin_mohm = (deflection_mv * 1e-3) / (sw["amp_pA"] * 1e-12) / 1e6  # V/A -> MOhm
+        rin_vals.append(rin_mohm)
+
+        if tau is not None and len(tau) > 0 and tau[0] is not None and rin_mohm != 0:
+            tau_ms = float(tau[0])
+            tau_vals.append(tau_ms)
+            cm_pf = (tau_ms * 1e-3) / (rin_mohm * 1e6) * 1e12  # s / Ohm -> F -> pF
+            cm_vals.append(cm_pf)
+
+    return {"RMP_mV": rmp_vals, "Rin_MOhm": rin_vals, "tau_m_ms": tau_vals, "Cm_pF": cm_vals}
+
+
+# ----------------------------------------------------------------------------
+# Active properties
+# ----------------------------------------------------------------------------
+def compute_active_properties(depol_sweeps):
+    """Returns dict with rheobase (single value), pooled spike lists and max frequency."""
+    thresholds, peaks, halfwidths = [], [], []
+    max_freq = 0.0
+    spiking_amps = []
+
+    for sw in depol_sweeps:
+        trace = {"T": sw["t_ms"], "V": sw["v_mV"],
+                 "stim_start": [sw["onset_ms"]], "stim_end": [sw["offset_ms"]]}
+        try:
+            feats = efel.get_feature_values(
+                [trace],
+                ["Spikecount", "mean_frequency", "AP_begin_voltage", "peak_voltage", "AP_width"],
+                raise_warnings=False)[0]
+        except Exception:
+            continue
+
+        sc = feats.get("Spikecount")
+        n_spikes = int(sc[0]) if sc is not None and len(sc) > 0 else 0
+        if n_spikes < 1:
+            continue
+
+        spiking_amps.append(sw["amp_pA"])
+
+        mf = feats.get("mean_frequency")
+        if mf is not None and len(mf) > 0 and mf[0] is not None:
+            max_freq = max(max_freq, float(mf[0]))
+
+        for fname, target in [("AP_begin_voltage", thresholds),
+                               ("peak_voltage", peaks),
+                               ("AP_width", halfwidths)]:
+            vals = feats.get(fname)
+            if vals is not None:
+                target.extend([float(v) for v in vals if v is not None])
+
+    rheobase = min(spiking_amps) if spiking_amps else np.nan
+    return {
+        "Rheobase_pA": rheobase,
+        "Threshold_mV": thresholds,
+        "AP_peak_mV": peaks,
+        "Halfwidth_ms": halfwidths,
+        "MaxFreq_Hz": max_freq,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Main pipeline
+# ----------------------------------------------------------------------------
+def main():
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    efel.set_setting("Threshold", SPIKE_THRESHOLD_MV)
+
+    cell_ids = discover_cell_ids(DATA_DIR)
+    if not cell_ids:
+        raise SystemExit(f"No '*_ephys.nwb' files found in {DATA_DIR}.")
+    print(f"{len(cell_ids)} cells found: {cell_ids}")
+
+    rows = []
+    for cell_id in cell_ids:
+        nwb_path = os.path.join(DATA_DIR, f"{cell_id}_ephys.nwb")
+        print(f"  Processing {cell_id} ...")
+        hyperpol, depol = classify_long_square_sweeps(nwb_path)
+        print(f"    {len(hyperpol)} hyperpolarizing, {len(depol)} depolarizing "
+              f"long-square sweeps found.")
+
+        passive = compute_passive_properties(hyperpol)
+        active = compute_active_properties(depol)
+
+        def mean_sd(values):
+            arr = np.asarray(values, dtype=float)
+            arr = arr[~np.isnan(arr)]
+            if len(arr) == 0:
+                return np.nan, np.nan
+            return float(np.mean(arr)), float(np.std(arr))
+
+        row = {"cell_id": cell_id, "species": species_from_id(cell_id)}
+        for key, label in [("RMP_mV", "RMP"), ("Rin_MOhm", "Rin"),
+                            ("tau_m_ms", "tau_m"), ("Cm_pF", "Cm")]:
+            m, s = mean_sd(passive[key])
+            row[f"{label}_mean"], row[f"{label}_sd"] = m, s
+
+        for key, label in [("Threshold_mV", "Threshold"), ("AP_peak_mV", "AP_peak"),
+                            ("Halfwidth_ms", "Halfwidth")]:
+            m, s = mean_sd(active[key])
+            row[f"{label}_mean"], row[f"{label}_sd"] = m, s
+
+        row["Rheobase_pA"] = active["Rheobase_pA"]
+        row["MaxFreq_Hz"] = active["MaxFreq_Hz"]
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(OUTPUT_DIR, "intrinsic_properties_per_cell.csv"), index=False)
+    print("\n--- intrinsic_properties_per_cell.csv ---")
+    print(df.to_string(index=False))
+
+    # ------------------------------------------------------------------
+    # Aggregation at species level: mean across cells + SEM
+    # (SEM = SD of the cell means / sqrt(n_cells))
+    # ------------------------------------------------------------------
+    panels = [
+        ("RMP_mean", "RMP (mV)"),
+        ("Rin_mean", "Rm / Input resistance (M\u03a9)"),
+        ("Cm_mean", "Cm (pF)"),
+        ("Rheobase_pA", "Rheobase (pA)"),
+        ("MaxFreq_Hz", "Max. spiking frequency (Hz)"),
+        ("Threshold_mean", "AP threshold (mV)"),
+        ("AP_peak_mean", "AP peak (mV)"),
+        ("Halfwidth_mean", "AP halfwidth (ms)"),
+    ]
+
+    species_list = sorted(df["species"].unique())
+    agg_rows = []
+    for sp in species_list:
+        sub = df[df["species"] == sp]
+        row = {"species": sp, "n_cells": len(sub)}
+        for col, _ in panels:
+            vals = sub[col].dropna().to_numpy()
+            n = len(vals)
+            mean = float(np.mean(vals)) if n > 0 else np.nan
+            sem = float(np.std(vals, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+            row[f"{col}_groupmean"] = mean
+            row[f"{col}_sem"] = sem
+        agg_rows.append(row)
+
+    agg_df = pd.DataFrame(agg_rows)
+    agg_df.to_csv(os.path.join(OUTPUT_DIR, "intrinsic_properties_by_species.csv"), index=False)
+    print("\n--- intrinsic_properties_by_species.csv ---")
+    print(agg_df.to_string(index=False))
+    print("\nNote: SEM is based on the spread of the cell means within "
+          "a group (n_cells). For n=1, no SEM can be computed (NaN); "
+          "for n=2 the SEM is mathematically valid but statistically not very stable.")
+
+    # ------------------------------------------------------------------
+    # Main figure: 8 panels, one bar PER SPECIES (mean +/- SEM)
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes = axes.flatten()
+    x = np.arange(len(species_list))
+    colors = [SPECIES_PALETTE.get(sp, "grey") for sp in species_list]
+
+    for ax, (col, title) in zip(axes, panels):
+        means = agg_df[f"{col}_groupmean"].to_numpy()
+        sems = agg_df[f"{col}_sem"].to_numpy()
+        ax.bar(x, means, yerr=sems, capsize=5, color=colors,
+               edgecolor="white", linewidth=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{sp}\n(n={n})" for sp, n in zip(species_list, agg_df["n_cells"])])
+        ax.set_title(title, fontsize=13)
+        sns.despine(ax=ax)
+
+    fig.suptitle("Intrinsic properties: Human vs. Mouse (mean \u00b1 SEM)", fontsize=16)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "intrinsic_properties_by_species_barplot.png"), dpi=200)
+    plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # Additional figure (optional): 1 bar per cell, as before -- for
+    # detailed supplementary view / QC, not the main figure.
+    # ------------------------------------------------------------------
+    panels_cell = [
+        ("RMP_mean", "RMP_sd", "RMP (mV)"),
+        ("Rin_mean", "Rin_sd", "Rm / Input resistance (M\u03a9)"),
+        ("Cm_mean", "Cm_sd", "Cm (pF)"),
+        ("Rheobase_pA", None, "Rheobase (pA)"),
+        ("MaxFreq_Hz", None, "Max. spiking frequency (Hz)"),
+        ("Threshold_mean", "Threshold_sd", "AP threshold (mV)"),
+        ("AP_peak_mean", "AP_peak_sd", "AP peak (mV)"),
+        ("Halfwidth_mean", "Halfwidth_sd", "AP halfwidth (ms)"),
+    ]
+
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    axes = axes.flatten()
+    x_cell = np.arange(len(df))
+    bar_colors = [SPECIES_PALETTE.get(sp, "grey") for sp in df["species"]]
+
+    for ax, (mean_col, sd_col, title) in zip(axes, panels_cell):
+        values = df[mean_col].to_numpy()
+        errors = df[sd_col].to_numpy() if sd_col else None
+        ax.bar(x_cell, values, yerr=errors, capsize=4, color=bar_colors,
+               edgecolor="white", linewidth=0.8)
+        ax.set_xticks(x_cell)
+        ax.set_xticklabels(df["cell_id"], rotation=60, ha="right", fontsize=8)
+        ax.set_title(title, fontsize=13)
+        sns.despine(ax=ax)
+
+    fig.suptitle("Intrinsic properties per cell (supplementary; SD across sweeps/spikes)",
+                 fontsize=16)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, "intrinsic_properties_per_cell_barplot.png"), dpi=200)
+    plt.close(fig)
+
+    print(f"\nDone. Results in: {os.path.abspath(OUTPUT_DIR)}")
+
+
+if __name__ == "__main__":
+    main()
