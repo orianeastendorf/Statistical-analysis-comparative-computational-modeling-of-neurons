@@ -80,7 +80,6 @@ REGION_PALETTE = {
 # Import & Process
 # --------------------------------------------------------------------------- #
 def resolve_input_files(inputs: list[str]) -> list[Path]:
-    """Löst Glob-Patterns auf und liefert eine sortierte, eindeutige Dateiliste."""
     files: list[Path] = []
     for pattern in inputs:
         matches = sorted(glob.glob(pattern))
@@ -88,7 +87,7 @@ def resolve_input_files(inputs: list[str]) -> list[Path]:
             if Path(pattern).exists():
                 matches = [pattern]
             else:
-                print(f"Warnung: Kein Treffer für Muster '{pattern}'", file=sys.stderr)
+                print(f"Warning: No hit for pattern '{pattern}'", file=sys.stderr)
         files.extend(Path(m) for m in matches)
     seen = set()
     unique_files = []
@@ -113,7 +112,6 @@ def parse_parameter_name(name: str) -> tuple[str, str, str]:
 
 
 def load_files(files: list[Path]) -> pd.DataFrame:
-    """Lädt alle CSV-Dateien und gibt ein Long-Format-DataFrame zurück."""
     frames = []
     for f in files:
         df = pd.read_csv(f)
